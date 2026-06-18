@@ -3,7 +3,7 @@ import { createRequire } from "module"
 import * as net from "net"
 import * as path from "path"
 import * as fs from "fs"
-import { execAdb, execAdbShell, resolveSerial } from "./adb.js"
+import { execAdb, execAdbShell, resolveSerial, getScreenSize } from "./adb.js"
 import {
   ADB_PATH,
   SCRCPY_SERVER_PORT,
@@ -268,11 +268,21 @@ export interface ScrcpySession {
   videoSocket: net.Socket | null
   videoProcess: ChildProcess | null
   frameBuffer: Buffer | null
+  // Native device resolution (from `wm size`). This is the coordinate space
+  // callers use — it matches ui_dump / ui_find_element bounds and `input tap`.
   screenSize: { width: number; height: number }
+  // The scrcpy encoder/video frame size (downscaled by max_size). The scrcpy
+  // touch protocol requires the touch message's screenSize to EXACTLY equal
+  // this; otherwise the server's PositionMapper silently discards the event.
+  // Input helpers scale native coords into this space before sending.
+  frameSize: { width: number; height: number }
+  // False when the scrcpy video stream could not be established (e.g. the
+  // device/emulator has no usable h264 encoder, so device metadata never
+  // arrived). The session is still usable for control (input/clipboard/etc.)
+  // via the control socket; screenshots fall back to `adb screencap`.
+  videoAvailable: boolean
   clipboardContent: string | null
-  viewerProcess: ChildProcess | null
-  viewerStdin: NodeJS.WritableStream | null
-  h264Buffer: Buffer  // rolling buffer for late viewer connections
+  viewerProcess: ChildProcess | null  // the native scrcpy viewer window, if open
 }
 
 const sessions: Map<string, ScrcpySession> = new Map()
@@ -297,7 +307,11 @@ const findFfmpeg = (): string => {
   }
   try {
     const ffmpegStatic: string | null = createRequire(import.meta.url)("ffmpeg-static")
-    if (ffmpegStatic) return ffmpegStatic
+    // ffmpeg-static resolves to a path even when its postinstall binary
+    // download was skipped/failed, so verify the file actually exists before
+    // returning it. Otherwise spawn fails with ENOENT and the video socket
+    // teardown cascades into killing the whole scrcpy session.
+    if (ffmpegStatic && fs.existsSync(ffmpegStatic)) return ffmpegStatic
   } catch {
     // ffmpeg-static not installed, fall back to system ffmpeg
   }
@@ -312,6 +326,12 @@ function startVideoStream(
   const ffmpegPath = findFfmpeg()
   
   const ffmpeg = spawn(ffmpegPath, [
+    // Keep stderr to genuine errors only: drop the startup banner, the
+    // input/output/stream-mapping dump, warnings, and the repeating
+    // "frame= …" progress lines. Real decode/encode errors still surface.
+    "-hide_banner",
+    "-loglevel", "error",
+    "-nostats",
     "-probesize", "1024",
     "-flags", "low_delay",
     "-f", "h264",
@@ -329,11 +349,9 @@ function startVideoStream(
   let jpegBuffer = Buffer.alloc(0)
   let firstFrameReceived = false
   let resolveFirstFrame: (() => void) | null = null
-  let rejectFirstFrame: ((err: Error) => void) | null = null
 
-  const firstFramePromise = new Promise<void>((resolve, reject) => {
+  const firstFramePromise = new Promise<void>((resolve) => {
     resolveFirstFrame = resolve
-    rejectFirstFrame = reject
   })
 
   // Timeout: if no frame arrives within 10 seconds, resolve anyway
@@ -409,18 +427,20 @@ function startVideoStream(
     console.error(`[scrcpy] [${session.serial}] ffmpeg stderr: ${data.toString().trim()}`)
   })
 
+  // When ffmpeg dies (e.g. missing binary, decode error) we deliberately do
+  // NOT tear down the video socket. The socket's "data" handler keeps draining
+  // bytes (discarding them once ffmpeg is gone), which keeps the scrcpy server
+  // alive so the control socket — and therefore input tools like tap/text/key —
+  // continue to work. Only screenshots/video are lost. The first-frame promise
+  // is resolved (not rejected) so the session is reported as usable.
   ffmpeg.on("error", (err: Error) => {
     console.error(`[scrcpy] ffmpeg error for ${session.serial}:`, err.message)
-    if (session.videoSocket) {
-      session.videoSocket.destroy()
-      session.videoSocket = null
-    }
     session.frameBuffer = null
     session.videoProcess = null
     if (!firstFrameReceived) {
       firstFrameReceived = true
       clearTimeout(firstFrameTimeout)
-      rejectFirstFrame?.(err)
+      resolveFirstFrame?.()
     }
   })
 
@@ -428,15 +448,11 @@ function startVideoStream(
     session.videoProcess = null
     if (code !== 0 && code !== null) {
       console.error(`[scrcpy] ffmpeg exited with code ${code} for ${session.serial}`)
-      if (session.videoSocket) {
-        session.videoSocket.destroy()
-        session.videoSocket = null
-      }
       session.frameBuffer = null
       if (!firstFrameReceived) {
         firstFrameReceived = true
         clearTimeout(firstFrameTimeout)
-        rejectFirstFrame?.(new Error(`ffmpeg exited with code ${code}`))
+        resolveFirstFrame?.()
       }
     }
   })
@@ -459,42 +475,16 @@ function startVideoStream(
       }
     })
 
-    // Tee the raw H.264 stream: ffmpeg (for JPEG frame extraction / screenshots)
-    // and optionally the viewer process stdin (raw H.264, no re-encode needed).
-    // A rolling buffer of recent H.264 data is kept so that a viewer that connects
-    // after session start can receive enough history to include a full keyframe
-    // (SPS+PPS+IDR), allowing it to start decoding immediately.
-    const MAX_H264_BUFFER = 2 * 1024 * 1024 // 2 MB ≈ 2s at 8Mbps
-
-    // Write any overflow bytes from the metadata read before starting the tee,
-    // and include them in the rolling H.264 history (they carry SPS/PPS/IDR data).
+    // Feed the raw H.264 stream into ffmpeg, which extracts JPEG frames for
+    // screenshots and the MJPEG HTTP stream. (The native scrcpy viewer window,
+    // when open, runs its own independent server and does not read from here.)
+    // Write any overflow bytes captured during the metadata read first.
     if (initialData && initialData.length > 0) {
       ffmpeg.stdin.write(initialData)
-      session.h264Buffer = Buffer.concat([session.h264Buffer, initialData])
-      if (session.h264Buffer.length > MAX_H264_BUFFER) {
-        session.h264Buffer = session.h264Buffer.subarray(
-          session.h264Buffer.length - MAX_H264_BUFFER
-        )
-      }
     }
     videoSocket.on("data", (chunk: Buffer) => {
       if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
         try { ffmpeg.stdin.write(chunk) } catch { /* EPIPE handled above */ }
-      }
-      // Update rolling H.264 buffer
-      session.h264Buffer = Buffer.concat([session.h264Buffer, chunk])
-      if (session.h264Buffer.length > MAX_H264_BUFFER) {
-        session.h264Buffer = session.h264Buffer.subarray(
-          session.h264Buffer.length - MAX_H264_BUFFER
-        )
-      }
-      if (session.viewerStdin) {
-        const vs = session.viewerStdin as NodeJS.WritableStream & { destroyed?: boolean }
-        if (!vs.destroyed) {
-          try { vs.write(chunk) } catch {
-            session.viewerStdin = null
-          }
-        }
       }
     })
   }
@@ -925,22 +915,83 @@ export async function startSession(
       )
     }
 
+    // The native display resolution (from `wm size`) is the coordinate space
+    // callers work in (matching ui_dump / ui_find_element / `input tap`), and
+    // is independent of the video stream — read it up front so it is available
+    // even if the video stream never comes up.
+    let nativeSize: { width: number; height: number } | null = null
+    try {
+      nativeSize = await getScreenSize(s)
+    } catch (err) {
+      console.error(
+        `[scrcpy] Could not read native size for ${s} via wm size:`,
+        (err as Error).message
+      )
+    }
+
     // Now that both sockets are connected, the server will proceed
-    // to send device metadata on the video socket.
-    const { width, height, overflow } = await receiveDeviceMeta(socket, port)
+    // to send device metadata on the video socket. We must consume these
+    // bytes off the socket regardless so the h264 stream isn't corrupted,
+    // but the width/height here are the *downscaled encoder frame* size
+    // (e.g. 576x1024 at max_size=1024), NOT the device's native resolution.
+    //
+    // If metadata never arrives (e.g. the device/emulator has no usable h264
+    // encoder, as on CI's swiftshader emulator) we don't hard-fail the whole
+    // session: control still works over the control socket, and screenshots
+    // fall back to `adb screencap`. We degrade to a video-less session instead.
+    let videoAvailable = true
+    let frameSize: { width: number; height: number }
+    let overflow = Buffer.alloc(0)
+    try {
+      const meta = await receiveDeviceMeta(socket, port)
+      frameSize = { width: meta.width, height: meta.height }
+      overflow = meta.overflow
+    } catch (err) {
+      videoAvailable = false
+      // Without device metadata there is no encoder frame size; fall back to
+      // the native size so coordinates map 1:1 (input helpers won't downscale).
+      frameSize = nativeSize ?? { width: 0, height: 0 }
+      console.error(
+        `[scrcpy] Device metadata not received for ${s}; continuing without ` +
+          `video (screenshots will use adb screencap):`,
+        (err as Error).message
+      )
+      // The video socket is unusable for streaming now; stop reading from it.
+      socket.destroy()
+    }
+
+    // Fall back to the frame size for native coords only if `wm size` failed
+    // AND we have a real frame size; otherwise coordinates are 1:1 with frame.
+    if (!nativeSize) {
+      nativeSize = videoAvailable ? frameSize : { width: 0, height: 0 }
+    }
+
+    // The scrcpy touch protocol requires the touch message's screenSize to
+    // EXACTLY equal the video frame size; a mismatch makes the server's
+    // PositionMapper silently drop the event. But callers (and ui_dump /
+    // ui_find_element / `input tap`) work in NATIVE display coordinates. So we
+    // expose the native size as `screenSize` (the coordinate space callers
+    // use) and keep the frame size as `frameSize`; the input helpers scale
+    // native coords into frame space before sending. max_size preserves aspect
+    // ratio, so this is a single uniform scale on both axes.
+    console.error(
+      `[scrcpy] Frame size ${frameSize.width}x${frameSize.height}, native size ` +
+        `${nativeSize.width}x${nativeSize.height}` +
+        (videoAvailable ? "" : " (video unavailable)")
+    )
 
     session = {
       serial: s,
       scid,
       controlSocket,
-      videoSocket: socket,
+      videoSocket: videoAvailable ? socket : null,
       videoProcess: null,
       frameBuffer: null,
-      screenSize: { width, height },
+      screenSize: nativeSize,
+      frameSize,
+      videoAvailable,
       clipboardContent: null,
       viewerProcess: null,
-      viewerStdin: null,
-      h264Buffer: Buffer.alloc(0),
     }
 
     const currentSession = session
@@ -951,13 +1002,15 @@ export async function startSession(
     // onNewVirtualDisplay callback (which sets up the PositionMapper for
     // touch coordinate mapping). Without this, touch events sent before the
     // PositionMapper is initialized are silently discarded by the server.
-    try {
-      await startVideoStream(currentSession, socket, overflow)
-    } catch (err) {
-      // If the video stream fails to produce a frame, the session is still
-      // usable for non-vision tools (key events, text input, etc.)
-      const msg = `[scrcpy] Video stream failed for ${s}, session partially ready:`
-      console.error(msg, (err as Error).message)
+    if (videoAvailable) {
+      try {
+        await startVideoStream(currentSession, socket, overflow)
+      } catch (err) {
+        // If the video stream fails to produce a frame, the session is still
+        // usable for non-vision tools (key events, text input, etc.)
+        const msg = `[scrcpy] Video stream failed for ${s}, session partially ready:`
+        console.error(msg, (err as Error).message)
+      }
     }
 
     controlSocket.on("close", () => {
@@ -1014,7 +1067,6 @@ export async function stopSession(serial: string): Promise<void> {
     session.viewerProcess.kill()
   }
   session.viewerProcess = null
-  session.viewerStdin = null
 
   try {
     await execAdbShell(s, `pkill -f scrcpy-server`)

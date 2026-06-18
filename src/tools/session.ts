@@ -14,21 +14,40 @@ export function registerSessionTools(server: McpServer): void {
         maxSize: z.number().int().positive().optional().default(1024).describe("Max screen dimension in pixels (default 1024)"),
         maxFps: z.number().int().positive().optional().default(30).describe("Max frames per second (default 30)"),
       },
+      outputSchema: {
+        status: z.string().describe("Session status (e.g. 'connected')"),
+        serial: z.string().describe("Resolved device serial"),
+        screenSize: z.object({
+          width: z.number().int().describe("Native display width"),
+          height: z.number().int().describe("Native display height"),
+        }).describe("Native display resolution — tap/swipe use these native coordinates, matching ui_dump / ui_find_element bounds directly (no scaling)"),
+        videoAvailable: z.boolean().describe("Whether the scrcpy video stream is up. When false, the session still works for input/clipboard but screenshots fall back to adb screencap."),
+        message: z.string().describe("Human-readable status message"),
+      },
+      annotations: {
+        title: "Start scrcpy Session",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
     },
     async ({ serial, maxSize, maxFps }) => {
       try {
         const s = await resolveSerial(serial)
         const session = await startSession(s, { maxSize, maxFps })
+        const structured = {
+          status: "connected",
+          serial: s,
+          screenSize: session.screenSize,
+          videoAvailable: session.videoAvailable,
+          message: session.videoAvailable
+            ? "scrcpy session active. Input and screenshots will use the fast path."
+            : "scrcpy session active for input, but the video stream is unavailable on this device; screenshots will fall back to adb screencap.",
+        }
         return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              status: "connected",
-              serial: s,
-              screenSize: session.screenSize,
-              message: "scrcpy session active. Input and screenshots will use the fast path.",
-            }, null, 2),
-          }],
+          content: [{ type: "text", text: JSON.stringify(structured, null, 2) }],
+          structuredContent: structured,
         }
       } catch (error) {
         const err = error as Error
@@ -40,6 +59,7 @@ export function registerSessionTools(server: McpServer): void {
               message: `Failed to start scrcpy session: ${err.message}`,
             }, null, 2),
           }],
+          isError: true as const,
         }
       }
     }
@@ -52,17 +72,27 @@ export function registerSessionTools(server: McpServer): void {
       inputSchema: {
         serial: z.string().optional().describe("Device serial number"),
       },
+      outputSchema: {
+        success: z.boolean().describe("Whether the session was stopped"),
+        message: z.string().describe("Human-readable status message"),
+      },
+      annotations: {
+        title: "Stop scrcpy Session",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
     },
     async ({ serial }) => {
       try {
         const s = await resolveSerial(serial)
         await stopSession(s)
         stopMjpegServer(s)
+        const message = "scrcpy session stopped. Tools will use ADB fallback."
         return {
-          content: [{
-            type: "text",
-            text: "scrcpy session stopped. Tools will use ADB fallback.",
-          }],
+          content: [{ type: "text", text: message }],
+          structuredContent: { success: true, message },
         }
       } catch (error) {
         const err = error as Error
@@ -74,6 +104,7 @@ export function registerSessionTools(server: McpServer): void {
               message: `Failed to stop scrcpy session: ${err.message}`,
             }),
           }],
+          isError: true as const,
         }
       }
     }

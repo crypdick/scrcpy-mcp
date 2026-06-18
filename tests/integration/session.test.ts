@@ -22,11 +22,21 @@ describe("Session Tools Integration", () => {
         maxSize: 800,
         maxFps: 15,
       })
-      const data = parseResult(result) as { status: string; screenSize: { width: number; height: number } }
+      const data = parseResult(result) as {
+        status: string
+        message?: string
+        screenSize: { width: number; height: number }
+      }
 
-      expect(data.status).toBe("connected")
+      // Surface the server-side message on failure so CI logs show the real
+      // cause (e.g. a device-metadata timeout) instead of just "error".
+      expect(data.status, `start_session failed: ${data.message}`).toBe("connected")
       expect(data.screenSize).toBeDefined()
-      expect(data.screenSize.width).toBeLessThanOrEqual(800)
+      // screenSize reports the NATIVE display resolution (the coordinate space
+      // tap/swipe use), not the downscaled max_size=800 video frame. So it is
+      // independent of maxSize and is typically larger than it.
+      expect(data.screenSize.width).toBeGreaterThan(0)
+      expect(data.screenSize.height).toBeGreaterThan(0)
     }, 30000)
 
     it("should take a screenshot via scrcpy session", async () => {
