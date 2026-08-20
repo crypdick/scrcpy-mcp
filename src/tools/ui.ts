@@ -49,14 +49,37 @@ export function parseUiNodes(xml: string): UiElement[] {
   return elements
 }
 
-async function dumpUiXml(serial: string): Promise<string> {
+export async function dumpUiXml(serial: string): Promise<string> {
   const tmpPath = `/sdcard/.ui_dump_${Date.now()}_${Math.random().toString(36).slice(2)}.xml`
-  const raw = await execAdbShell(
-    serial,
-    `uiautomator dump --compressed ${tmpPath} 2>/dev/null; cat ${tmpPath}; rm -f ${tmpPath}`
-  )
-  // Strip the trailing status line uiautomator appends (e.g. "UI hierchary dumped to: ...")
-  return raw.replace(/UI hier[^\n]*dumped to:[^\n]*/gi, "").trim()
+  const failures: string[] = []
+
+  try {
+    for (const includeAllWindows of [false, true]) {
+      try {
+        const windows = includeAllWindows ? "--windows " : ""
+        await execAdbShell(
+          serial,
+          `uiautomator dump ${windows}--compressed ${tmpPath}`
+        )
+        const raw = await execAdbShell(serial, `cat ${tmpPath}`)
+        const xml = raw.replace(/UI hier[^\n]*dumped to:[^\n]*/gi, "").trim()
+        if (xml.includes("<hierarchy") && xml.includes("</hierarchy>")) {
+          return xml
+        }
+        failures.push("uiautomator returned empty or invalid XML")
+      } catch (error) {
+        failures.push((error as Error).message)
+      }
+    }
+  } finally {
+    try {
+      await execAdbShell(serial, `rm -f ${tmpPath}`)
+    } catch (error) {
+      console.error(`[ui] Failed to remove temporary dump ${tmpPath}:`, error)
+    }
+  }
+
+  throw new Error(`Failed to produce a valid UI hierarchy: ${failures.join("; ")}`)
 }
 
 export function registerUiTools(server: McpServer): void {

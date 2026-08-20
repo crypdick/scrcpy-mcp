@@ -450,6 +450,7 @@ function startVideoStream(
     console.error(`[scrcpy] ffmpeg error for ${session.serial}:`, err.message)
     session.frameBuffer = null
     session.videoProcess = null
+    session.videoAvailable = false
     if (!firstFrameReceived) {
       firstFrameReceived = true
       clearTimeout(firstFrameTimeout)
@@ -462,6 +463,7 @@ function startVideoStream(
     if (code !== 0 && code !== null) {
       console.error(`[scrcpy] ffmpeg exited with code ${code} for ${session.serial}`)
       session.frameBuffer = null
+      session.videoAvailable = false
       if (!firstFrameReceived) {
         firstFrameReceived = true
         clearTimeout(firstFrameTimeout)
@@ -924,20 +926,55 @@ export async function pushScrcpyServer(serial: string, serverPath: string): Prom
   await execAdb(["-s", serial, "push", serverPath, SCRCPY_SERVER_PATH_LOCAL], 30000)
 }
 
+export interface ForwardEndpoint {
+  adbLocal: string
+  connectOptions: net.NetConnectOpts
+}
+
+export function createForwardEndpoint(
+  port: number,
+  adbServerSocket = process.env.ADB_SERVER_SOCKET
+): ForwardEndpoint {
+  const prefix = "localfilesystem:"
+  if (adbServerSocket?.startsWith(prefix)) {
+    // ADB creates forwards in the daemon's namespace, not the client's. Put a
+    // pathname socket beside a pathname ADB socket so the same bind mount makes
+    // both reachable from a container. Keep its name stable: `forward --remove`
+    // leaves the inode behind, while the next `forward` safely rebinds it.
+    const adbSocketPath = adbServerSocket.slice(prefix.length)
+    const socketPath = path.join(
+      path.dirname(adbSocketPath),
+      `scrcpy-${port}.sock`
+    )
+    return {
+      adbLocal: `${prefix}${socketPath}`,
+      connectOptions: { path: socketPath },
+    }
+  }
+
+  return {
+    adbLocal: `tcp:${port}`,
+    connectOptions: { port, host: "127.0.0.1" },
+  }
+}
+
 export async function setupPortForwarding(
   serial: string,
-  port: number,
+  endpoint: ForwardEndpoint,
   scid: number
 ): Promise<void> {
   const socketName = getSocketName(scid)
   await execAdb(
-    ["-s", serial, "forward", `tcp:${port}`, `localabstract:${socketName}`]
+    ["-s", serial, "forward", endpoint.adbLocal, `localabstract:${socketName}`]
   )
 }
 
-export async function removePortForwarding(serial: string, port: number): Promise<void> {
+export async function removePortForwarding(
+  serial: string,
+  endpoint: ForwardEndpoint
+): Promise<void> {
   try {
-    await execAdb(["-s", serial, "forward", "--remove", `tcp:${port}`])
+    await execAdb(["-s", serial, "forward", "--remove", endpoint.adbLocal])
   } catch {
     // Ignore errors if forwarding doesn't exist
   }
@@ -1113,19 +1150,22 @@ export function startScrcpyServer(
 
 
 
-// In forward tunnel mode, `adb forward` accepts TCP connections even when no
-// server is listening behind the tunnel. To detect that the server is actually
-// ready we read the dummy byte (sent by scrcpy with send_dummy_byte=true) after
-// the TCP connection is established. If the read fails, the server is not ready.
-const connectAndVerify = async (port: number, timeout = 10000): Promise<net.Socket> =>
+// In forward tunnel mode, `adb forward` accepts connections even when no server
+// is listening behind the tunnel. To detect that the server is actually ready
+// we read the dummy byte (sent by scrcpy with send_dummy_byte=true) after the
+// forwarded connection is established. If the read fails, the server is not ready.
+const connectAndVerify = async (
+  endpoint: ForwardEndpoint,
+  timeout = 10000
+): Promise<net.Socket> =>
   new Promise((resolve, reject) => {
-    const socket = net.createConnection({ port, host: "127.0.0.1" })
+    const socket = net.createConnection(endpoint.connectOptions)
     let settled = false
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
       socket.destroy()
-      reject(new Error(`Connection timeout to port ${port}`))
+      reject(new Error(`Connection timeout to ${endpoint.adbLocal}`))
     }, timeout)
 
     const fail = (err: Error) => {
@@ -1137,11 +1177,11 @@ const connectAndVerify = async (port: number, timeout = 10000): Promise<net.Sock
     }
 
     socket.on("error", (err) => fail(
-      new Error(`Socket error connecting to port ${port}`, { cause: err })
+      new Error(`Socket error connecting to ${endpoint.adbLocal}`, { cause: err })
     ))
 
     socket.on("connect", () => {
-      // TCP connected to the ADB tunnel. Now read the dummy byte to verify
+      // Connected to the ADB tunnel. Now read the dummy byte to verify
       // the scrcpy server is actually listening behind the tunnel.
       socket.once("data", (chunk: Buffer) => {
         if (settled) return
@@ -1161,12 +1201,15 @@ const connectAndVerify = async (port: number, timeout = 10000): Promise<net.Sock
     })
   })
 
-const connectToServer = async (port: number, timeout = 10000): Promise<net.Socket> =>
+const connectToServer = async (
+  endpoint: ForwardEndpoint,
+  timeout = 10000
+): Promise<net.Socket> =>
   new Promise((resolve, reject) => {
-    const socket = net.createConnection({ port, host: "127.0.0.1" })
+    const socket = net.createConnection(endpoint.connectOptions)
     const timer = setTimeout(() => {
       socket.destroy()
-      reject(new Error(`Connection timeout to port ${port}`))
+      reject(new Error(`Connection timeout to ${endpoint.adbLocal}`))
     }, timeout)
 
     socket.on("connect", () => {
@@ -1176,7 +1219,7 @@ const connectToServer = async (port: number, timeout = 10000): Promise<net.Socke
 
     socket.on("error", (err) => {
       clearTimeout(timer)
-      reject(new Error(`Socket error connecting to port ${port}`, { cause: err }))
+      reject(new Error(`Socket error connecting to ${endpoint.adbLocal}`, { cause: err }))
     })
   })
 
@@ -1376,13 +1419,14 @@ export async function startSession(
 
   const port = SCRCPY_SERVER_PORT
   const scid = generateScid()
-  await setupPortForwarding(s, port, scid)
+  const endpoint = createForwardEndpoint(port)
+  await setupPortForwarding(s, endpoint, scid)
 
   let serverProcess: ScrcpyServerProcess
   try {
     serverProcess = await startScrcpyServer(s, scid, options)
   } catch (err) {
-    await removePortForwarding(s, port)
+    await removePortForwarding(s, endpoint)
     throw err
   }
 
@@ -1401,7 +1445,7 @@ export async function startSession(
   // layout differs, handled below via videoMetaLayout.)
   while (Date.now() < deadline) {
     try {
-      socket = await connectAndVerify(port, 2000)
+      socket = await connectAndVerify(endpoint, 2000)
       break
     } catch (err) {
       lastError = err as Error
@@ -1422,7 +1466,7 @@ export async function startSession(
       // Ignore if process doesn't exist
     }
     try {
-      await removePortForwarding(s, port)
+      await removePortForwarding(s, endpoint)
     } catch {
       // Ignore if forwarding doesn't exist
     }
@@ -1445,7 +1489,7 @@ export async function startSession(
       try {
         const remaining = controlConnectDeadline - Date.now()
         if (remaining <= 0) break
-        controlSocket = await connectToServer(port, remaining)
+        controlSocket = await connectToServer(endpoint, remaining)
         break
       } catch (err) {
         lastControlError = err as Error
@@ -1582,7 +1626,7 @@ export async function startSession(
     } catch {
       // Ignore if process doesn't exist
     }
-    await removePortForwarding(s, port)
+    await removePortForwarding(s, endpoint)
     throw err
   }
 }
@@ -1621,7 +1665,10 @@ export async function stopSession(serial: string): Promise<void> {
     // Ignore if process doesn't exist
   }
 
-  await removePortForwarding(s, SCRCPY_SERVER_PORT)
+  await removePortForwarding(
+    s,
+    createForwardEndpoint(SCRCPY_SERVER_PORT)
+  )
 
   sessions.delete(s)
 }

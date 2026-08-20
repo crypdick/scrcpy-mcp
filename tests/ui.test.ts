@@ -1,5 +1,13 @@
-import { describe, it, expect } from "vitest"
-import { parseUiNodes } from "../src/tools/ui.js"
+import { beforeEach, describe, it, expect, vi } from "vitest"
+import { execAdbShell } from "../src/utils/adb.js"
+import { dumpUiXml, parseUiNodes } from "../src/tools/ui.js"
+
+vi.mock("../src/utils/adb.js", () => ({
+  execAdbShell: vi.fn(),
+  resolveSerial: vi.fn(),
+}))
+
+const execAdbShellMock = vi.mocked(execAdbShell)
 
 const SAMPLE_XML = `<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy rotation="0">
@@ -9,6 +17,36 @@ const SAMPLE_XML = `<?xml version="1.0" encoding="UTF-8"?>
     <node index="2" text="" resource-id="" class="android.widget.ImageView" package="com.example.app" content-desc="Company logo" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[440,200][640,400]" />
   </node>
 </hierarchy>`
+
+describe("dumpUiXml", () => {
+  beforeEach(() => {
+    execAdbShellMock.mockReset()
+  })
+
+  it("retries all windows when the active-window dump fails", async () => {
+    execAdbShellMock.mockImplementation(async (_serial, command) => {
+      if (command.startsWith("uiautomator dump --compressed")) {
+        throw new Error("null root node returned by UiTestAutomationBridge")
+      }
+      if (command.startsWith("uiautomator dump --windows --compressed")) return ""
+      if (command.startsWith("cat ")) return SAMPLE_XML
+      if (command.startsWith("rm -f ")) return ""
+      throw new Error(`Unexpected command: ${command}`)
+    })
+
+    await expect(dumpUiXml("SERIAL")).resolves.toBe(SAMPLE_XML)
+    expect(execAdbShellMock).toHaveBeenCalledWith(
+      "SERIAL",
+      expect.stringContaining("uiautomator dump --windows --compressed")
+    )
+  })
+
+  it("rejects empty output instead of reporting success", async () => {
+    execAdbShellMock.mockResolvedValue("")
+
+    await expect(dumpUiXml("SERIAL")).rejects.toThrow("valid UI hierarchy")
+  })
+})
 
 describe("parseUiNodes", () => {
   it("parses all nodes from the hierarchy", () => {

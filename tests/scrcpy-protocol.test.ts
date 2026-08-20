@@ -13,6 +13,7 @@ import {
   serializeRotateDevice,
   serializeStartApp,
   consumeDeviceMessages,
+  createForwardEndpoint,
 } from "../src/utils/scrcpy.js"
 import {
   CONTROL_MSG_TYPE_INJECT_KEYCODE as MSG_INJECT_KEYCODE,
@@ -31,6 +32,27 @@ import {
   DEVICE_MSG_TYPE_ACK_CLIPBOARD,
   MAX_CLIPBOARD_BYTES,
 } from "../src/utils/constants.js"
+
+describe("createForwardEndpoint", () => {
+  it("uses a filesystem socket beside a filesystem ADB server socket", () => {
+    expect(
+      createForwardEndpoint(
+        27183,
+        "localfilesystem:/run/pynchy-adb/adb.sock"
+      )
+    ).toEqual({
+      adbLocal: "localfilesystem:/run/pynchy-adb/scrcpy-27183.sock",
+      connectOptions: { path: "/run/pynchy-adb/scrcpy-27183.sock" },
+    })
+  })
+
+  it("keeps loopback TCP for a local or TCP ADB server", () => {
+    expect(createForwardEndpoint(27183, "tcp:adb.example:5037")).toEqual({
+      adbLocal: "tcp:27183",
+      connectOptions: { port: 27183, host: "127.0.0.1" },
+    })
+  })
+})
 
 describe("serializeInjectKeycode", () => {
   it("produces a 14-byte buffer", () => {

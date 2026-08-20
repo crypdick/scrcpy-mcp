@@ -258,6 +258,7 @@ start_session → take screenshots → tap → swipe → ...
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ADB_PATH` | `adb` | Path to the ADB binary |
+| `ADB_SERVER_SOCKET` | (ADB default) | ADB server endpoint. A `localfilesystem:` socket also places scrcpy forwards beside it, allowing a shared bind mount to bridge container namespaces. |
 | `ANDROID_SERIAL` | (none) | Default device serial, overrides auto-detection |
 | `SCRCPY_SERVER_PATH` | (auto) | Path to the scrcpy-server binary |
 | `SCRCPY_SERVER_VERSION` | (auto) | Version of the scrcpy-server binary |
