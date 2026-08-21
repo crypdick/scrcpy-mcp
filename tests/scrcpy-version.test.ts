@@ -166,14 +166,17 @@ describe("buildServerArgs", () => {
     }
   })
 
-  it.each(["3.3.4", "4.0"])(
-    "keeps the plugged-in device awake for version %s",
-    (version) => {
-      expect(buildServerArgs("SERIAL", 0x1234, version)).toContain(
-        "stay_awake=true"
-      )
-    }
-  )
+  it("uses scrcpy 4's permission-free activity keepalive", () => {
+    expect(buildServerArgs("SERIAL", 0x1234, "4.0")).toContain(
+      "keep_active=true"
+    )
+    expect(buildServerArgs("SERIAL", 0x1234, "3.3.4")).not.toContain(
+      "keep_active=true"
+    )
+    expect(buildServerArgs("SERIAL", 0x1234, "4.0")).not.toContain(
+      "stay_awake=true"
+    )
+  })
 })
 
 describe("videoMetaLayout", () => {
