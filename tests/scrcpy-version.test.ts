@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { execFileSync } from "child_process"
+import { execFileSync, spawn } from "child_process"
 import * as fs from "fs"
 import * as path from "path"
 import {
@@ -12,6 +12,7 @@ import {
   detectScrcpyVersionInfo,
   detectScrcpyVersion,
   buildFfmpegArgs,
+  terminateChildProcess,
   __resetScrcpyDetectionCachesForTests,
 } from "../src/utils/scrcpy.js"
 import {
@@ -188,6 +189,16 @@ describe("buildFfmpegArgs", () => {
     expect(args[filterIndex + 1]).toBe(
       "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuvj420p"
     )
+  })
+})
+
+describe("terminateChildProcess", () => {
+  it("waits until the child has been reaped", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"])
+
+    await terminateChildProcess(child)
+
+    expect(child.signalCode).toBe("SIGTERM")
   })
 })
 
