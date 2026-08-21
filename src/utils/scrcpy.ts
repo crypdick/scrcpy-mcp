@@ -1017,6 +1017,7 @@ export function buildServerArgs(
     "audio=false",
     "video=true",
     "cleanup=true",
+    "stay_awake=true",
     "power_off_on_close=false",
     "clipboard_autosync=true",
     "downsize_on_error=false",

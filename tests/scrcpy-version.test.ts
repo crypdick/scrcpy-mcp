@@ -165,6 +165,15 @@ describe("buildServerArgs", () => {
       expect(args).toContain("video_bit_rate=4000000")
     }
   })
+
+  it.each(["3.3.4", "4.0"])(
+    "keeps the plugged-in device awake for version %s",
+    (version) => {
+      expect(buildServerArgs("SERIAL", 0x1234, version)).toContain(
+        "stay_awake=true"
+      )
+    }
+  )
 })
 
 describe("videoMetaLayout", () => {
