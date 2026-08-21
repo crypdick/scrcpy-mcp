@@ -11,3 +11,6 @@ coverage/
 opencode.json
 .mcp.json
 *.mcpb
+.new-feature/
+.worktrees/
+*.local.toml
