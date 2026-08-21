@@ -11,6 +11,7 @@ import {
   computeScrcpyVersionInfo,
   detectScrcpyVersionInfo,
   detectScrcpyVersion,
+  buildFfmpegArgs,
   __resetScrcpyDetectionCachesForTests,
 } from "../src/utils/scrcpy.js"
 import {
@@ -175,6 +176,17 @@ describe("buildServerArgs", () => {
     )
     expect(buildServerArgs("SERIAL", 0x1234, "4.0")).not.toContain(
       "stay_awake=true"
+    )
+  })
+})
+
+describe("buildFfmpegArgs", () => {
+  it("normalizes device colorspace before encoding JPEG frames", () => {
+    const args = buildFfmpegArgs()
+    const filterIndex = args.indexOf("-vf")
+
+    expect(args[filterIndex + 1]).toBe(
+      "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuvj420p"
     )
   })
 })

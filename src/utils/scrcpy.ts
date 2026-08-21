@@ -331,14 +331,8 @@ const findFfmpeg = (): string => {
   return "ffmpeg"
 }
 
-function startVideoStream(
-  session: ScrcpySession,
-  videoSocket: net.Socket,
-  initialData?: Buffer
-): Promise<void> {
-  const ffmpegPath = findFfmpeg()
-  
-  const ffmpeg = spawn(ffmpegPath, [
+export function buildFfmpegArgs(): string[] {
+  return [
     // Keep stderr to genuine errors only: drop the startup banner, the
     // input/output/stream-mapping dump, warnings, and the repeating
     // "frame= …" progress lines. Real decode/encode errors still surface.
@@ -349,12 +343,22 @@ function startVideoStream(
     "-flags", "low_delay",
     "-f", "h264",
     "-i", "pipe:0",
+    "-vf", "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuvj420p",
     "-f", "image2pipe",
     "-vcodec", "mjpeg",
     "-q:v", "5",
     "-flush_packets", "1",
     "pipe:1",
-  ])
+  ]
+}
+
+function startVideoStream(
+  session: ScrcpySession,
+  videoSocket: net.Socket,
+  initialData?: Buffer
+): Promise<void> {
+  const ffmpegPath = findFfmpeg()
+  const ffmpeg = spawn(ffmpegPath, buildFfmpegArgs())
 
   session.videoProcess = ffmpeg
   session.videoSocket = videoSocket
