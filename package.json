@@ -1,6 +1,6 @@
 {
   "name": "scrcpy-mcp",
-  "version": "0.4.1-pynchy.5",
+  "version": "0.4.1-pynchy.6",
   "mcpName": "io.github.JuanCF/scrcpy-mcp",
   "description": "MCP server for Android device control via ADB and scrcpy — gives AI agents vision and control over Android devices",
   "keywords": [
@@ -41,7 +41,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
-    "prepublishOnly": "npm run build",
+    "prepack": "npm run build",
     "pack:bundle": "rm -rf node_modules && npm ci --omit=dev --omit=optional && mcpb pack",
     "pack:publish": "smithery mcp publish ./scrcpy-mcp.mcpb -n JuanCF/scrcpy-mcp"
   },
