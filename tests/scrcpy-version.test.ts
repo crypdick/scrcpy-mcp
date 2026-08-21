@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { execFileSync, spawn } from "child_process"
+import { once } from "events"
 import * as fs from "fs"
 import * as path from "path"
 import {
@@ -199,6 +200,18 @@ describe("terminateChildProcess", () => {
     await terminateChildProcess(child)
 
     expect(child.signalCode).toBe("SIGTERM")
+  })
+
+  it("forces a child that ignores SIGTERM to exit", async () => {
+    const child = spawn(process.execPath, [
+      "-e",
+      "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+    ])
+    await once(child.stdout!, "data")
+
+    await terminateChildProcess(child, 20)
+
+    expect(child.signalCode).toBe("SIGKILL")
   })
 })
 

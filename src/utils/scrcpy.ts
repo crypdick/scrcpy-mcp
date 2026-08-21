@@ -353,13 +353,37 @@ export function buildFfmpegArgs(): string[] {
   ]
 }
 
-export async function terminateChildProcess(child: ChildProcess): Promise<void> {
+function waitForChildClose(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const onClose = (): void => {
+      clearTimeout(timeout)
+      resolve(true)
+    }
+    const timeout = setTimeout(() => {
+      child.off("close", onClose)
+      resolve(false)
+    }, timeoutMs)
+    child.once("close", onClose)
+  })
+}
+
+export async function terminateChildProcess(
+  child: ChildProcess,
+  timeoutMs = 1000
+): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return
   }
 
-  const closed = once(child, "close")
+  const closedGracefully = waitForChildClose(child, timeoutMs)
+  child.stdin?.end()
   child.kill()
+  if (await closedGracefully || child.exitCode !== null || child.signalCode !== null) {
+    return
+  }
+
+  const closed = once(child, "close")
+  child.kill("SIGKILL")
   await closed
 }
 
