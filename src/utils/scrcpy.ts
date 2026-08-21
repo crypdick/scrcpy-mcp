@@ -1,5 +1,6 @@
 import { spawn, execFileSync, ChildProcess } from "child_process"
 import { createRequire } from "module"
+import { once } from "events"
 import * as net from "net"
 import * as path from "path"
 import { StringDecoder } from "string_decoder"
@@ -350,6 +351,16 @@ export function buildFfmpegArgs(): string[] {
     "-flush_packets", "1",
     "pipe:1",
   ]
+}
+
+export async function terminateChildProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return
+  }
+
+  const closed = once(child, "close")
+  child.kill()
+  await closed
 }
 
 function startVideoStream(
@@ -1654,15 +1665,12 @@ export async function stopSession(serial: string): Promise<void> {
     session.controlSocket = null
   }
 
-  if (session.videoProcess) {
-    session.videoProcess.kill()
-    session.videoProcess = null
-  }
-
-  if (session.viewerProcess && !session.viewerProcess.killed) {
-    session.viewerProcess.kill()
-  }
+  const childProcesses = [session.videoProcess, session.viewerProcess].filter(
+    (child): child is ChildProcess => child !== null
+  )
+  session.videoProcess = null
   session.viewerProcess = null
+  await Promise.all(childProcesses.map(terminateChildProcess))
 
   try {
     await execAdbShell(s, `pkill -f scrcpy-server`)
